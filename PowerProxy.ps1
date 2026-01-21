@@ -1190,7 +1190,8 @@ function Read-Socks5Message {
     $Buffer = New-Object System.Byte[] $Nmethods
     $ClientStream.Read($Buffer, 0, $NMethods)
     $Methods = @()
-    for ($i = 0; $i -le $Nmethods; $i++) {
+    # 使用 -lt 避免越界访问
+    for ($i = 0; $i -lt $NMethods; $i++) {
         if ($Buffer[$i] -eq 0) {
             $Methods += "NOAUTH"
         }
