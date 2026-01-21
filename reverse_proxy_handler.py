@@ -27,7 +27,8 @@ class ProxyHandler:
     ssl_key = None
 
     def __init__(self, proxy_addr, proxy_port, listen_addr, listen_port):
-
+        # 初始化两个监听端：一个给客户端（本地 SOCKS/上游），一个给反向代理
+        # 负责对接 SOCKS/客户端连接的监听地址与端口
         # Server that handles clients
         self.client_address = proxy_addr
         self.client_port = int(proxy_port)
@@ -40,9 +41,19 @@ class ProxyHandler:
         # Active connections from reverse proxies (sockets)
         self.reverse_sockets = queue.Queue()
 
+    @staticmethod
+    def _safe_close(sock, logger_hint="socket"):
+        """安全关闭 socket：避免重复关闭或未初始化导致的异常。"""
+        if sock is None:
+            return
+        try:
+            sock.close()
+        except OSError as e:
+            logger.debug("[!] Failed to close {}: {}".format(logger_hint, e))
 
     # SSL/TLS for connection with remote proxies
     def set_ssl_context(self, certificate=None, private_key=None, verify=True):
+        """为反向代理连接创建 SSL/TLS 上下文。"""
 
         # Create SSL context using highest TLS version available for client & server.
         # Uses system certs (?). verify_mode defaults to CERT_REQUIRED
@@ -72,6 +83,7 @@ class ProxyHandler:
 
     # Master thread
     def serve(self):
+        """启动监听线程并维持主循环，直到收到退出信号。"""
 
         # Handle Ctrl-C
         signal.signal(signal.SIGINT, self.sig_handler)
@@ -88,7 +100,7 @@ class ProxyHandler:
             logger.warning("[!] WARNING: SSL context not set. Connections to reverse proxies will not be encrypted!")
 
         try:
-            # Listen for connections from reverse proxies
+            # 监听来自反向代理的连接
             reverse_listener = socket.socket(
                 socket.AF_INET, socket.SOCK_STREAM)
             reverse_listener.setsockopt(
@@ -107,7 +119,7 @@ class ProxyHandler:
             logger.info("Listening for reverse proxies on {}:{}".format(
                 self.reverse_address, self.reverse_port))
 
-            # Listen for clients
+            # 监听客户端（本地/上游）连接
             client_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             client_listener.setsockopt(
                 socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -132,9 +144,11 @@ class ProxyHandler:
             logger.error("[!] ERROR in master thread: {}".format(e))
             raise e
         finally:
+            # 主线程退出时，确保本地资源回收
             self.kill_local_process()
 
     def sig_handler(self, signal_number, stack_frame):
+        """处理 SIGINT/SIGTERM，确保资源释放并退出。"""
 
         if signal_number == 2:
             logger.warning("\n[!] SIGINT received")
@@ -147,18 +161,20 @@ class ProxyHandler:
 
     # Close all sockets and threads, then exit. Does not send kill signal to remote machines
     def kill_local_process(self):
+        """关闭本地 sockets/线程并退出；可选通知远端反向代理。"""
 
         #logger.info("Shutting down!")
         self.shutdown_flag.set()
-        self.reverse_listener_sock.close()
-        self.client_listener_sock.close()
+        # 关闭监听 socket，避免阻塞 accept
+        self._safe_close(self.reverse_listener_sock, logger_hint="reverse_listener_sock")
+        self._safe_close(self.client_listener_sock, logger_hint="client_listener_sock")
 
         if self.kill_reverse:
             self.kill_reverse_process()
 
         while not self.reverse_sockets.empty():
             s = self.reverse_sockets.get()
-            s.close()
+            self._safe_close(s, logger_hint="reverse_socket")
         
         sys.exit(0)
 
@@ -166,6 +182,7 @@ class ProxyHandler:
     def kill_reverse_process(self, timeout=1, address=None):
         # TODO - Use address arg to only kill hosts at a given address
 
+        # 向所有空闲的反向代理发送 KILL 信号，要求远端退出
         message = 'KILL'.encode()
 
         # Track proxies that reply 'DEAD' (i.e. confirm shutdown)
@@ -207,6 +224,7 @@ class ProxyHandler:
 
     # Listen for incoming connections from reverse proxies
     def listen_for_reverse(self, listen_socket, backlog=20):
+        """接收反向代理连接，并将其加入待使用队列。"""
 
         # Start listening
         listen_socket.listen(backlog)
@@ -220,6 +238,7 @@ class ProxyHandler:
                 continue
             except OSError as e:
                 if e.errno == 9:
+                    # 监听 socket 已关闭，退出线程
                     return
                 else:
                     raise
@@ -236,6 +255,7 @@ class ProxyHandler:
 
     # Listen for proxy clients
     def listen_for_client(self, srv_sock, backlog=10):
+        """接收客户端连接，每个连接单独开线程进行转发。"""
 
         srv_sock.listen(backlog)
 
@@ -247,6 +267,7 @@ class ProxyHandler:
             # When shutdown signalled, socket is destroyed at some point, raises OSerror errno9
             except OSError as e:
                 if e.errno == 9:
+                    # 监听 socket 已关闭，退出线程
                     return
                 else:
                     raise
@@ -265,7 +286,9 @@ class ProxyHandler:
 
     # Proxy connection between client and remote
     def forward_connection(self, client_socket, reverse_socket=None, wait=5, max_fails=10):
+        """在客户端与反向代理之间进行双向转发。"""
 
+        # 获取一个可用的反向代理连接，必要时等待/重试
         reverse_socket = self.get_available_reverse(wait=wait, max_attempts=max_fails)
         
         # Get basic info on client/remote
@@ -291,6 +314,7 @@ class ProxyHandler:
             for sock in receivable:
 
                 if sock is reverse_socket:
+                    # 反向代理 -> 客户端
                     data = b''
                     while True:
                         try:
@@ -310,11 +334,12 @@ class ProxyHandler:
                         client_socket.sendall(data)
                     else:
                         logger.error("[!] Reverse proxy disconnected while forwarding!")
-                        client_socket.close()
-                        reverse_socket.close()
+                        self._safe_close(client_socket, logger_hint="client_socket")
+                        self._safe_close(reverse_socket, logger_hint="reverse_socket")
                         return
 
                 if sock is client_socket:
+                    # 客户端 -> 反向代理
                     data = b''
                     while True:
                         try:
@@ -335,13 +360,14 @@ class ProxyHandler:
                     else:
                         # Connection is closed
                         logger.debug("[x] Closing connection to client {}. Forwarding complete".format(client_addr))
-                        client_socket.close()
-                        reverse_socket.close()
+                        self._safe_close(client_socket, logger_hint="client_socket")
+                        self._safe_close(reverse_socket, logger_hint="reverse_socket")
                         return
 
 
     # Return socket connected to reverse proxy
     def get_available_reverse(self, wait=1, max_attempts=5):
+        """从队列中取出一个可用的反向代理连接，不足则等待重试。"""
 
         reverse_socket = None
 
@@ -371,6 +397,7 @@ class ProxyHandler:
 
     # Check on waiting reverse proxies to see if connection still open
     def poll_reverse_connections(self, timeout=0.2, wait_time=1):
+        """轮询空闲反向代理连接，维护在线代理列表。"""
 
         # Track connections (value is a set())
         self.reverse_connections = dict()
@@ -404,7 +431,7 @@ class ProxyHandler:
                     try:
                         # Close socket
                         reverse_sock.shutdown(socket.SHUT_RDWR)         # Disallow further reads and writes
-                        reverse_sock.close()
+                        self._safe_close(reverse_sock, logger_hint="reverse_socket")
                     except OSError as e:
                         # Socket not connected error
                         if e.errno == 57:
@@ -425,6 +452,7 @@ class ProxyHandler:
  
             # timeout will happen if connection still open
             except socket.timeout:
+                # timeout 表示连接依旧存活
 
                 # If address is known
                 if self.reverse_connections.get(address, False):
@@ -450,6 +478,7 @@ class ProxyHandler:
 
     # Send 'WAKE' message to waiting reverse proxy. Return reply message
     def wake_reverse(self, reverse_sock, max_attempts=5):
+        """通知反向代理进入转发状态，期望返回 'WOKE'。"""
 
         reply = None 
 
@@ -473,6 +502,7 @@ class ProxyHandler:
 
 # Use OpenSSL to create a server cert. Returns (cert_path, key_path)
 def create_ssl_cert(cert_path=None, key_path=None, temporary=True):
+    """生成 SSL 证书/私钥文件并返回路径。"""
 
     # Create paths to output cert and key
     if temporary:
@@ -521,6 +551,7 @@ def create_ssl_cert(cert_path=None, key_path=None, temporary=True):
         logger.info("Path to SSL key: {}".format(key_path))
     
     # Now run OpenSSL
+    # 通过 openssl 生成自签证书；若 openssl 不可用，将返回非零码
     openssl = f'openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout {key_path} -out {cert_path} -batch -subj /CN={domain}'
     openssl_result = subprocess.run(openssl.split(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
@@ -713,4 +744,5 @@ if __name__ == '__main__':
     try:
         main()
     finally:
-        queue_listener.stop
+        # 停止日志监听线程，避免程序退出时阻塞
+        queue_listener.stop()
