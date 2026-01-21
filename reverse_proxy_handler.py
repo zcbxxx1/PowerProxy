@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import queue
+from typing import Optional, Tuple
 
 
 class ProxyHandler:
@@ -28,11 +29,11 @@ class ProxyHandler:
 
     def __init__(self, proxy_addr, proxy_port, listen_addr, listen_port):
 
-        # Server that handles clients
+        # Server that handles clients（本地 SOCKS 客户端）
         self.client_address = proxy_addr
         self.client_port = int(proxy_port)
         self.client_listener_sock = None
-        # Server that handles remote proxies
+        # Server that handles remote proxies（反向代理客户端）
         self.reverse_address = listen_addr
         self.reverse_port = int(listen_port)
         self.reverse_listener_sock = None
@@ -40,20 +41,34 @@ class ProxyHandler:
         # Active connections from reverse proxies (sockets)
         self.reverse_sockets = queue.Queue()
 
+    @staticmethod
+    def _safe_close(sock: Optional[socket.socket]) -> None:
+        """安全关闭 socket，避免在关闭过程中抛出异常导致流程中断。"""
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            # 可能已关闭/未连接，忽略即可
+            pass
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     # SSL/TLS for connection with remote proxies
     def set_ssl_context(self, certificate=None, private_key=None, verify=True):
 
-        # Create SSL context using highest TLS version available for client & server.
-        # Uses system certs (?). verify_mode defaults to CERT_REQUIRED
+        # 创建 SSL 上下文，优先使用系统默认 CA；默认 verify_mode 为 CERT_REQUIRED
         ssl_context = ssl.create_default_context(
             purpose=ssl.Purpose.SERVER_AUTH,
         )
 
-        # Don't check hostname
+        # 不校验 hostname（反向代理一般非公开域名）
         ssl_context.check_hostname = False
 
-        # Store paths to cert and key files
+        # 保存证书与私钥路径
         if certificate:
             self.ssl_cert = os.path.abspath(certificate)
             if private_key:
@@ -63,7 +78,7 @@ class ProxyHandler:
 
         ssl_context.load_cert_chain(self.ssl_cert, keyfile=self.ssl_key)
 
-        # Don't be a dick about certs:
+        # 可选：放宽证书验证（便于自签证书）
         if not verify:
             ssl_context.verify_mode = ssl.CERT_OPTIONAL
         
@@ -73,11 +88,11 @@ class ProxyHandler:
     # Master thread
     def serve(self):
 
-        # Handle Ctrl-C
+        # 捕获 Ctrl-C / SIGTERM，优雅退出
         signal.signal(signal.SIGINT, self.sig_handler)
         signal.signal(signal.SIGTERM, self.sig_handler)
 
-        # Start thread tracking connections
+        # 启动线程：轮询检测反向代理连接是否存活
         connection_poller_t = threading.Thread(
             target=self.poll_reverse_connections,
             name="connection_poller"
@@ -88,7 +103,7 @@ class ProxyHandler:
             logger.warning("[!] WARNING: SSL context not set. Connections to reverse proxies will not be encrypted!")
 
         try:
-            # Listen for connections from reverse proxies
+            # 监听来自反向代理的连接
             reverse_listener = socket.socket(
                 socket.AF_INET, socket.SOCK_STREAM)
             reverse_listener.setsockopt(
@@ -97,7 +112,7 @@ class ProxyHandler:
             reverse_listener.bind((self.reverse_address, self.reverse_port))
             self.reverse_listener_sock = reverse_listener
 
-            # TODO: set threadnames, for better logging
+            # 单独线程接入反向代理连接
             reverse_listener_t = threading.Thread(
                 target=self.listen_for_reverse,
                 args=[reverse_listener, ],
@@ -107,7 +122,7 @@ class ProxyHandler:
             logger.info("Listening for reverse proxies on {}:{}".format(
                 self.reverse_address, self.reverse_port))
 
-            # Listen for clients
+            # 监听本地客户端
             client_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             client_listener.setsockopt(
                 socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -124,7 +139,7 @@ class ProxyHandler:
             logger.info("Listening for clients on {}:{}".format(
                 self.client_address, self.client_port))
 
-            # TODO: some sort of monitoring process. Temporarily just join() thread to keep proc going
+            # 保持主线程存活，等待退出信号
             while not self.shutdown_flag.is_set():
                 time.sleep(0.5)
 
@@ -150,15 +165,15 @@ class ProxyHandler:
 
         #logger.info("Shutting down!")
         self.shutdown_flag.set()
-        self.reverse_listener_sock.close()
-        self.client_listener_sock.close()
+        self._safe_close(self.reverse_listener_sock)
+        self._safe_close(self.client_listener_sock)
 
         if self.kill_reverse:
             self.kill_reverse_process()
 
         while not self.reverse_sockets.empty():
             s = self.reverse_sockets.get()
-            s.close()
+            self._safe_close(s)
         
         sys.exit(0)
 
@@ -183,23 +198,23 @@ class ProxyHandler:
                 reply = s.recv(2048)
                 if len(reply) == 0:
                     # connection already closed
-                    s.close()
+                    self._safe_close(s)
                     continue
                 elif reply == b'DEAD':
                     dead_count += 1
-                    s.close()
+                    self._safe_close(s)
                     continue
                 else:
                     # try one more time, since shit's weird
                     reply += s.recv(2048)
                     if reply == b'DEAD':
                         dead_count += 1
-                        s.close()
+                        self._safe_close(s)
                         continue
             except socket.timeout:
                 pass
             finally:
-                s.close()
+                self._safe_close(s)
 
         if sock_count:
             logger.info("'KILL' message sent to {} proxies. {} confirmed 'DEAD'".format(sock_count, dead_count))
@@ -208,12 +223,12 @@ class ProxyHandler:
     # Listen for incoming connections from reverse proxies
     def listen_for_reverse(self, listen_socket, backlog=20):
 
-        # Start listening
+        # 开始监听反向代理连接
         listen_socket.listen(backlog)
 
         while not self.shutdown_flag.is_set():
 
-            # Accept connection, not yet encrypted
+            # 接收连接（先是明文连接）
             try:
                 clear_socket, __ = listen_socket.accept()
             except socket.timeout:
@@ -224,14 +239,14 @@ class ProxyHandler:
                 else:
                     raise
 
-            # Encrypt connection
+            # 如果启用了 SSL，则升级为加密连接
             if self.ssl_context:
                 reverse_socket = self.ssl_context.wrap_socket(
                     clear_socket, server_side=True)
             else:
                 reverse_socket = clear_socket
 
-            # Store socket for use with client later
+            # 保存 socket 以供客户端连接使用
             self.reverse_sockets.put(reverse_socket)
 
     # Listen for proxy clients
@@ -255,6 +270,7 @@ class ProxyHandler:
             address = f"{address[0]}:{address[1]}"
             logger.info("[*] Client connected from {}".format(address))
 
+            # 每个客户端由独立线程进行转发
             forward_conn_t = threading.Thread(
                 target=self.forward_connection,
                 args=[client_socket, ],
@@ -268,14 +284,14 @@ class ProxyHandler:
 
         reverse_socket = self.get_available_reverse(wait=wait, max_attempts=max_fails)
         
-        # Get basic info on client/remote
+        # 获取客户端和反向代理的基本信息用于日志
         client_addr = client_socket.getpeername()
         reverse_addr = reverse_socket.getpeername()
 
         # debug message
         logger.debug("[_] Tunneling {} through {}".format(client_addr, reverse_addr))
 
-        # Send reverse_socket "WAKE" message to wake for proxying
+        # 通知反向代理开始转发
         self.wake_reverse(reverse_socket)
 
         #######################
@@ -285,7 +301,8 @@ class ProxyHandler:
         reverse_socket.setblocking(False)
         client_socket.setblocking(False)
 
-        while  not self.shutdown_flag.is_set():
+        # 进入转发循环：select 监视两个 socket
+        while not self.shutdown_flag.is_set():
             receivable, __, __ = select.select([reverse_socket, client_socket], [], [])
 
             for sock in receivable:
@@ -310,8 +327,8 @@ class ProxyHandler:
                         client_socket.sendall(data)
                     else:
                         logger.error("[!] Reverse proxy disconnected while forwarding!")
-                        client_socket.close()
-                        reverse_socket.close()
+                        self._safe_close(client_socket)
+                        self._safe_close(reverse_socket)
                         return
 
                 if sock is client_socket:
@@ -335,8 +352,8 @@ class ProxyHandler:
                     else:
                         # Connection is closed
                         logger.debug("[x] Closing connection to client {}. Forwarding complete".format(client_addr))
-                        client_socket.close()
-                        reverse_socket.close()
+                        self._safe_close(client_socket)
+                        self._safe_close(reverse_socket)
                         return
 
 
@@ -375,8 +392,7 @@ class ProxyHandler:
         # Track connections (value is a set())
         self.reverse_connections = dict()
 
-        # TODO: what's the in/out pattern for Queue? Don't want to just check on same sock over and over
-        # But also, this should still work even if it did. Just not ideal
+        # TODO: Queue 的出入顺序会影响检测的公平性，这里仅做简单轮询
          
         while not (self.shutdown_flag.is_set()):
             
@@ -384,22 +400,22 @@ class ProxyHandler:
                 time.sleep(wait_time)
                 continue
             
-            # Get a connection to check on
+            # 取出一个连接进行存活检测
             reverse_sock = self.reverse_sockets.get()
             address = reverse_sock.getpeername()[0]
             sock_id = id(reverse_sock)
 
             connection_count = self.reverse_sockets.qsize()
 
-            # store current timeout setting
+            # 保存原始超时时间，避免影响正常数据传输
             old_timeout = reverse_sock.gettimeout()
-            # set timeout to something short
+            # 使用短超时进行探测
             reverse_sock.settimeout(timeout)
 
             try:
                 data = reverse_sock.recv(2048)
 
-                # Means connection closed
+                # 收到空数据，表示连接已断开
                 if len(data) == 0:
                     try:
                         # Close socket
@@ -423,23 +439,23 @@ class ProxyHandler:
                         logger.info("[-] Reverse proxy {} lost".format(address))
 
  
-            # timeout will happen if connection still open
+            # timeout 表示连接仍然存活
             except socket.timeout:
 
-                # If address is known
+                # 已知地址：新增连接计数
                 if self.reverse_connections.get(address, False):
                     if sock_id not in self.reverse_connections[address]:
                         self.reverse_connections[address].add(sock_id)
                         logger.debug("[+] Connection to proxy {} added ({} total)".format(address, (connection_count + 1)))
 
-                # Address is new
+                # 新地址：首次登记
                 else:
                     self.reverse_connections[address] = set()
                     self.reverse_connections[address].add(sock_id)
                     logger.info("[+] New reverse proxy: {}".format(address))
                     logger.debug("[+] Connection to proxy {} added (1 total)".format(address))
 
-                # Set timeout to original value, put back in queue
+                # 恢复超时并放回队列
                 reverse_sock.settimeout(old_timeout)
                 self.reverse_sockets.put(reverse_sock)
             
@@ -472,9 +488,9 @@ class ProxyHandler:
         return reply
 
 # Use OpenSSL to create a server cert. Returns (cert_path, key_path)
-def create_ssl_cert(cert_path=None, key_path=None, temporary=True):
+def create_ssl_cert(cert_path=None, key_path=None, temporary=True) -> Tuple[str, str]:
 
-    # Create paths to output cert and key
+    # 创建证书和私钥输出路径
     if temporary:
         logger.info("[&] Creating temporary SSL cert")
         domain = "example.local"
@@ -485,13 +501,13 @@ def create_ssl_cert(cert_path=None, key_path=None, temporary=True):
     else:
         logger.info("[&] Creating SSL cert")
 
-        # OpenSSL wants this
+        # OpenSSL 需要 CN（域名）
         try:
             domain = os.uname().nodename
         except:
             domain = "example.local"
 
-        # Create certificate path
+        # 生成证书路径
         if cert_path != None:
             if os.path.exists(cert_path):
                 temp_cert_path = os.path.join(tempfile.gettempdir(), os.path.splitext(sys.argv[0])[0]) + ".pem"
@@ -504,7 +520,7 @@ def create_ssl_cert(cert_path=None, key_path=None, temporary=True):
             else:
                 cert_path = os.path.join(tempfile.gettempdir(), "cert.pem")
 
-        # Create key path
+        # 生成私钥路径
         if key_path !=  None:
             if os.path.exists(key_path):
                 temp_key_path = os.path.join(tempfile.gettempdir(), os.path.splitext(sys.argv[0])[0]) + ".key"
@@ -520,7 +536,7 @@ def create_ssl_cert(cert_path=None, key_path=None, temporary=True):
         logger.info("Path to SSL cert: {}".format(cert_path))
         logger.info("Path to SSL key: {}".format(key_path))
     
-    # Now run OpenSSL
+    # 调用 OpenSSL 生成证书
     openssl = f'openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout {key_path} -out {cert_path} -batch -subj /CN={domain}'
     openssl_result = subprocess.run(openssl.split(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
@@ -668,7 +684,7 @@ if __name__ == '__main__':
     #####
     global logger
 
-    # Create queue (no size limit), handled by a QueueHandler instance
+    # 创建无大小限制的队列，由 QueueHandler 异步处理日志
     log_queue = queue.Queue(-1)
     queue_handler = logging.handlers.QueueHandler(log_queue)
 
@@ -709,8 +725,8 @@ if __name__ == '__main__':
     # /LOGGING
     ##########
 
-    # Hope this doesn't fuck this up, but structured so listener will always stop on program exit
+    # 保证程序退出时停止日志监听器
     try:
         main()
     finally:
-        queue_listener.stop
+        queue_listener.stop()
